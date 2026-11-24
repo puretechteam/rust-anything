@@ -4,6 +4,9 @@
 
 - `app record` and `app replay` fail with `port <port> is already in use` before spawning a server
   on an occupied port and check whether the child exited before treating the port as ready (#326).
+- When no port is set, `app record --http` and `app replay` pick another free port (up to 5) if the
+  one picked was taken before the server started, instead of failing with `port <port> is already
+  in use`.
 
 ## 4.0.0 (2026-11-24)
 

@@ -180,6 +180,45 @@ pub fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
+/// How many ports a server start picks before it gives up, when no port was given.
+const PICKS: usize = 5;
+
+/// Something already listens on the port a server was to start on.
+#[derive(Debug)]
+struct PortInUse(u16);
+
+impl std::fmt::Display for PortInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "port {} is already in use", self.0)
+    }
+}
+
+impl std::error::Error for PortInUse {}
+
+/// Runs `start` on a port from `pick`, and on another when that one was taken: `free_port` lets
+/// its port go, and another process (a test running alongside, say) can take it before the
+/// server starts. Gives up after `PICKS` ports.
+fn on_a_picked_port<T>(
+    mut pick: impl FnMut() -> Result<u16>,
+    mut start: impl FnMut(u16) -> Result<T>,
+) -> Result<T> {
+    for _ in 1..PICKS {
+        match start(pick()?) {
+            Err(e) if e.is::<PortInUse>() => continue,
+            done => return done,
+        }
+    }
+    start(pick()?).map_err(|e| {
+        if e.is::<PortInUse>() {
+            e.context(format!(
+                "{PICKS} free ports were picked and each was taken before the server started"
+            ))
+        } else {
+            e
+        }
+    })
+}
+
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -348,8 +387,14 @@ struct Server {
 
 impl Server {
     fn start(command: &[String], launch: &Launch, repo: &Path, port: u16) -> Result<Server> {
+        // The sinks listen first, so one handed the port that was picked for the server is found
+        // here, not mistaken for the server once it is ready.
+        let sinks = launch
+            .effects
+            .map(crate::effects::Sinks::start)
+            .transpose()?;
         if TcpStream::connect_timeout(&local(port), Duration::from_millis(100)).is_ok() {
-            bail!("port {port} is already in use");
+            return Err(PortInUse(port).into());
         }
         let dir = app::temp_dir("server")?;
         let words: Vec<String> = command
@@ -366,14 +411,9 @@ impl Server {
             }
             None => repo.to_path_buf(),
         };
-        let sinks = launch
-            .effects
-            .map(|config| -> Result<_> {
-                let sinks = crate::effects::Sinks::start(config)?;
-                sinks.reset(&cwd)?;
-                Ok(sinks)
-            })
-            .transpose()?;
+        if let Some(sinks) = &sinks {
+            sinks.reset(&cwd)?;
+        }
         let mut child = Command::new(program)
             .args(rest)
             .args(
@@ -487,16 +527,19 @@ struct Launch<'a> {
     effects: Option<&'a crate::effects::EffectsConfig>,
 }
 
-/// Starts the server once and sends every request in order.
+/// Starts the server once, on `port` or a free one, and sends every request in order.
 fn run_all(
     command: &[String],
     launch: &Launch,
     repo: &Path,
-    port: u16,
+    port: Option<u16>,
     reqs: &[&Req],
     timeout: Duration,
 ) -> Result<Vec<Answer>> {
-    let mut server = Server::start(command, launch, repo, port)?;
+    let mut server = match port {
+        Some(port) => Server::start(command, launch, repo, port)?,
+        None => on_a_picked_port(free_port, |port| Server::start(command, launch, repo, port))?,
+    };
     let mut out = Vec::new();
     for req in reqs {
         let before = server.fallbacks().unwrap_or(0);
@@ -929,22 +972,8 @@ pub(crate) fn record(
         pace: http.pace_ms.map(Duration::from_millis),
         effects: config.effects.as_ref(),
     };
-    let one = run_all(
-        &config.run,
-        &launch,
-        repo,
-        fixed.map_or_else(free_port, Ok)?,
-        &reqs,
-        timeout,
-    )?;
-    let two = run_all(
-        &config.run,
-        &launch,
-        repo,
-        fixed.map_or_else(free_port, Ok)?,
-        &reqs,
-        timeout,
-    )?;
+    let one = run_all(&config.run, &launch, repo, fixed, &reqs, timeout)?;
+    let two = run_all(&config.run, &launch, repo, fixed, &reqs, timeout)?;
 
     let dir = app::cases_dir(repo).join(HTTP_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1121,10 +1150,7 @@ pub(crate) fn replay(
 ) -> Result<ReplayOutcome> {
     let dir = app::cases_dir(repo);
     let specs = app::only_case(load_specs(&dir.join(HTTP_DIR))?, case, |s| &s.name)?;
-    let port = match port.or(config.http.as_ref().and_then(|h| h.port)) {
-        Some(p) => p,
-        None => free_port()?,
-    };
+    let port = port.or(config.http.as_ref().and_then(|h| h.port));
     let reqs: Vec<&Req> = specs.iter().map(|s| &s.req).collect();
     let files = saved_snapshot(repo, config)?;
     let http = config.http.clone().unwrap_or_default();
@@ -1239,6 +1265,74 @@ pub(crate) fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `on_a_picked_port` on these ports, with a start that finds every port in `taken` in
+    /// use, and returns its result and the ports it started on.
+    fn picking(ports: &[u16], taken: &[u16]) -> (Result<u16>, Vec<u16>) {
+        let mut ports = ports.iter().copied();
+        let mut tried = Vec::new();
+        let started = on_a_picked_port(
+            || ports.next().context("no port left"),
+            |port| {
+                tried.push(port);
+                if taken.contains(&port) {
+                    Err(PortInUse(port).into())
+                } else {
+                    Ok(port)
+                }
+            },
+        );
+        (started, tried)
+    }
+
+    #[test]
+    fn a_picked_port_taken_before_the_server_starts_is_picked_again() {
+        let (started, tried) = picking(&[5001, 5002], &[5001]);
+        assert_eq!(started.unwrap(), 5002);
+        assert_eq!(tried, [5001, 5002]);
+    }
+
+    #[test]
+    fn picking_gives_up_after_five_taken_ports() {
+        let (started, tried) = picking(&[1, 2, 3, 4, 5, 6], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            format!("{:#}", started.unwrap_err()),
+            "5 free ports were picked and each was taken before the server started: \
+             port 5 is already in use"
+        );
+        assert_eq!(tried, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_server_that_fails_for_another_reason_is_not_started_again() {
+        let mut tried = 0;
+        let started: Result<()> = on_a_picked_port(
+            || Ok(5001),
+            |_| {
+                tried += 1;
+                bail!("exited before listening")
+            },
+        );
+        assert!(started.is_err());
+        assert_eq!(tried, 1);
+    }
+
+    #[test]
+    fn a_server_start_on_a_port_in_use_says_so() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let launch = Launch {
+            args: &[],
+            files: None,
+            pace: None,
+            effects: None,
+        };
+        let err = Server::start(&["unused".to_string()], &launch, Path::new("."), port)
+            .err()
+            .expect("the port is taken");
+        assert!(err.is::<PortInUse>(), "{err:#}");
+        assert_eq!(err.to_string(), format!("port {port} is already in use"));
+    }
 
     #[test]
     fn curl_lines_become_requests() {
