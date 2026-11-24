@@ -115,6 +115,13 @@ result JSON cannot hold (a PHP string that is not UTF-8). The only `html_entity_
 After writing inputs for a behavior, check that `cases.jsonl` holds them, and break the port once
 to see `diff` fail.
 
+**A server start failed on a port nothing had asked for.** `free_port` binds port 0 and lets
+the port go, so a test running alongside (or an effect sink) could be handed it before the
+server started, and `port N is already in use` failed `ruby_server` and
+`a_server_that_mails_twice_fails_only_on_that_request` on macOS CI. A start on a picked port
+picks another when that one is taken, and the sinks listen before the check; a port that is
+picked is only free until something else binds it.
+
 ## Numbers and claims
 
 **Benchmarks taken while other builds ran were off by a wide margin.** Run `bench` on a quiet

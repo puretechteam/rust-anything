@@ -60,6 +60,9 @@
 - `bridge` types Go `uint64` and `uint` as `u64` and `uintptr` as `usize` in `port.rs`, alone or as
   slice items. They were `i64`, so a result above `i64::MAX` could not go back to Go and failed
   `diff` (#357).
+- When no port is set, `app record --http` and `app replay` pick another free port (up to 5) if the
+  one picked was taken before the server started, instead of failing with `port <port> is already
+  in use`.
 
 ## 4.0.0 (2026-11-24)
 
